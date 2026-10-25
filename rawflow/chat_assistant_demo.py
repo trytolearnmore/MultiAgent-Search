@@ -58,7 +58,6 @@ def ask_question(chat_name,question):
     # 流的每一部分的对象 part
     for part in response:
         # 数据存在对象中content上！！
-        print(part.content)
         result = part.content
     # 5. 关闭提问的会话
     # chat -> 关闭 -》  session

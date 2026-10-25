@@ -131,6 +131,15 @@ LLM_QWEN_MAX=deepseek-chat
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
 ```
 
+反思机制默认开启。进行 A/B 评测时可在 `.env` 中切换：
+
+```env
+ENABLE_REFLECTION=true   # 开启反思
+# ENABLE_REFLECTION=false  # 关闭反思
+```
+
+修改该开关后需要重启后端服务。任务开始事件和 `data/task_execution.log` 会记录本次运行的开关状态。
+
 ### 3. 启动
 
 ```bash
@@ -291,6 +300,12 @@ MultiAgent-Search/
 ### Q: 为什么用 ContextVar 而不是全局变量？
 
 **A:** FastAPI 下多个请求跑在同一线程的不同协程里。用全局变量的话，用户 A 的数据会被用户 B 覆盖（串台）。ContextVar 是 asyncio 原生支持的协程级变量，每个请求链路互不干扰。
+
+### 任务级执行限制
+
+- `MAX_NETWORK_SEARCHES` 控制单个用户任务实际允许的网络搜索次数，默认值为 `5`。额度在调用外部搜索接口前原子扣减，并行调用和工具内部重试都不能突破上限。
+- 同一个用户任务内，每种子智能体只会实际调度一次；重复请求会返回结构化的 `DuplicateSubagentDispatch` 错误，主智能体继续使用首次结果完成汇总。
+- 每次“继续当前会话”提交的新问题都会创建一套新的任务额度，不会沿用上一轮已经消耗的次数。
 
 ### Q: 项目为什么不到 1000 行？
 

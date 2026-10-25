@@ -5,10 +5,12 @@ from langchain_core.tools import tool
 from tavily import TavilyClient
 
 import os
+import time
 from dotenv import load_dotenv
 
 from api.monitor import monitor
-from utils.retry import retry_with_backoff
+from api.context import get_task_execution_limits
+from utils.tool_result import tool_failure
 
 # ======================== 初始化配置 ========================
 load_dotenv()
@@ -21,23 +23,52 @@ tavily_client = TavilyClient(
 
 # ======================== 带重试的搜索封装 ========================
 
-@retry_with_backoff(
-    max_retries=3,
-    base_delay=1.0,
-    max_delay=10.0,
-    exceptions=(Exception,),
-)
-def _search_with_retry(query: str, topic: str, max_results: int, include_raw_content: bool):
+class SearchLimitExceeded(RuntimeError):
+    """网络搜索（含内部重试）达到单任务硬上限。"""
+
+
+def _consume_retry_budget() -> None:
+    """内部重试前再占用一次额度，确保真实外部请求数也不超限。"""
+    limits = get_task_execution_limits()
+    if limits is None:
+        return
+    allowed, used = limits.try_consume_network_search()
+    if not allowed:
+        raise SearchLimitExceeded(
+            f"单任务网络搜索硬上限为 {limits.max_network_searches} 次，当前已使用 {used} 次"
+        )
+
+
+def _search_with_retry(
+    query: str,
+    topic: str,
+    max_results: int,
+    include_raw_content: bool,
+    *,
+    first_attempt_reserved: bool = False,
+):
     """
-    对 Tavily 搜索调用包装指数退避重试。
-    网络抖动或 Tavily 临时不可用时自动重试，最多 3 次。
+    对 Tavily 搜索调用进行指数退避重试，且每次真实请求都占用任务额度。
     """
-    return tavily_client.search(
-        query=query,
-        topic=topic,
-        max_results=max_results,
-        include_raw_content=include_raw_content,
-    )
+    delay = 1.0
+    last_exception = None
+    for attempt in range(4):
+        if attempt > 0 or not first_attempt_reserved:
+            _consume_retry_budget()
+        try:
+            return tavily_client.search(
+                query=query,
+                topic=topic,
+                max_results=max_results,
+                include_raw_content=include_raw_content,
+            )
+        except Exception as exc:
+            last_exception = exc
+            if attempt == 3:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, 10.0)
+    raise last_exception
 
 
 # ======================== LangChain 工具定义 ========================
@@ -58,7 +89,20 @@ def internet_search(
     :param include_raw_content: 是否返回原内容 False 精简 True 详细
     :return: 搜索结果
     """
-    # 每次调用工具，都向前端推送调用进度
+    # 在真正请求外部接口前原子占用额度，确保并行搜索也不会突破硬上限。
+    limits = get_task_execution_limits()
+    if limits is not None:
+        allowed, used = limits.try_consume_network_search()
+        if not allowed:
+            return tool_failure(
+                "internet_search",
+                f"单任务网络搜索硬上限为 {limits.max_network_searches} 次，当前已使用 {used} 次",
+                error_type="SearchLimitExceeded",
+                retryable=False,
+                guidance="停止继续搜索，使用已有结果完成回答，并在限制与风险中说明搜索额度已用尽。",
+            )
+
+    # 每次实际调用工具，都向前端推送调用进度
     monitor.report_tool(
         tool_name="网络搜索工具",
         args={
@@ -70,9 +114,23 @@ def internet_search(
     )
 
     # 带重试的搜索调用（指数退避，最多 3 次）
-    return _search_with_retry(
-        query=query,
-        topic=topic,
-        max_results=max_results,
-        include_raw_content=include_raw_content,
-    )
+    try:
+        return _search_with_retry(
+            query=query,
+            topic=topic,
+            max_results=max_results,
+            include_raw_content=include_raw_content,
+            first_attempt_reserved=True,
+        )
+    except Exception as e:
+        return tool_failure(
+            "internet_search",
+            e,
+            error_type=(
+                "SearchLimitExceeded"
+                if isinstance(e, SearchLimitExceeded)
+                else None
+            ),
+            retryable=False,
+            guidance="网络搜索已完成内部重试，请调整关键词或在最终结果中说明外部信息暂不可用。",
+        )

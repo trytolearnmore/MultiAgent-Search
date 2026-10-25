@@ -1,15 +1,37 @@
-#  get_assistant_list 获取聊天助手和知识库信息
-#  create_ask_delete  创建提问和删除会话获取rag查询结果
+"""供内部知识助手调用的 RAGFlow 工具。"""
+
+from collections.abc import Mapping
+from functools import lru_cache
+from uuid import uuid4
+
 from langchain_core.tools import tool
-# 导入依赖
-from ragflow_sdk import RAGFlow #链接rag服务的客户端
+from ragflow_sdk import RAGFlow
 
 from api.monitor import monitor
 from rawflow.rag_config import _load_ragflow_env
+from utils.tool_result import tool_failure
 
-# 创建一个ragflow的客户端
-api_key , base_url =_load_ragflow_env()
-ragflow_client = RAGFlow(api_key=api_key,base_url=base_url)
+
+@lru_cache(maxsize=1)
+def _get_ragflow_client() -> RAGFlow:
+    """按需创建客户端，避免未配置 RAGFlow 时阻塞整个应用启动。"""
+    api_key, base_url = _load_ragflow_env()
+    missing = []
+    if not api_key or not api_key.strip():
+        missing.append("RAGFLOW_API_KEY")
+    if not base_url or not base_url.strip():
+        missing.append("RAGFLOW_API_URL")
+    if missing:
+        raise RuntimeError(f"缺少 RAGFlow 配置：{', '.join(missing)}")
+
+    return RAGFlow(api_key=api_key.strip(), base_url=base_url.strip().rstrip("/"))
+
+
+def _dataset_name(dataset: object) -> str:
+    """兼容 SDK 将知识库表示为字典或对象的情况。"""
+    if isinstance(dataset, Mapping):
+        return str(dataset.get("name") or "").strip()
+    return str(getattr(dataset, "name", "") or "").strip()
 
 
 
@@ -29,32 +51,32 @@ def get_assistant_list() -> str:
     # 埋点,调用工具了告诉前端哪个工具被调用了！！
     monitor.report_tool(tool_name="ragflow聊天助手列表查询工具：get_assistant_list")
 
-    # 1. 创建ragflow客户端
     try:
-        # 2. ragflow客户端查询所有的聊天助手 page: int = 1, page_size: int = 30
-        chat_list = ragflow_client.list_chats()
+        ragflow_client = _get_ragflow_client()
+        chat_list = ragflow_client.list_chats(page=1, page_size=100)
         if not chat_list:
             return "没有任何可用助手"
-        # 3. 查询聊天助手的知识库信息
-        count_chat_info = "" #存储所有会话信息
-        for chat in chat_list:
-            dataset_names = []
-            dataset_list = chat.datasets #当前聊天助手关联的知识库
-            if dataset_list and isinstance(dataset_list,list):
-                # 知识库的name
-                for dataset in dataset_list:
-                    # print(dataset)
-                    dataset_names.append(dataset['name']) # 将一个助手的知识库的名字加入到列表中
 
-            # 拼接格式: 助手名称 + 介绍 + 关联知识库列表
-            count_chat_info += f"助手名称:{chat.name};功能介绍：{chat.description}; 关联的知识库：{'、'.join(dataset_names)} \n"
-        return count_chat_info
+        chat_info = []
+        for chat in chat_list:
+            dataset_names = [
+                name
+                for dataset in (getattr(chat, "datasets", None) or [])
+                if (name := _dataset_name(dataset))
+            ]
+            name = str(getattr(chat, "name", "") or "未命名助手")
+            description = str(getattr(chat, "description", "") or "无")
+            datasets = "、".join(dataset_names) or "无"
+            chat_info.append(
+                f"助手名称:{name};功能介绍：{description};关联的知识库：{datasets}"
+            )
+        return "\n".join(chat_info)
     except Exception as e:
-        return f"查询助手信息异常，无可用助手,异常信息:{str(e)}"
+        return tool_failure("get_assistant_list", e)
 
 # 2. 对某个助手进行提问（创建会话 -》 提问 -》 删除会话）
 @tool
-def create_ask_delete(chat_name,question)->str:
+def create_ask_delete(chat_name: str, question: str) -> str:
     """
     想某个助手，创建单次会话进行提问，提问完毕以后会关闭会话！
     主要查询ragflow中相关的信息！
@@ -65,30 +87,53 @@ def create_ask_delete(chat_name,question)->str:
     """
     # 埋点,调用工具了告诉前端哪个工具被调用了！！
     monitor.report_tool(tool_name="ragflow提问助手工具：create_ask_delete",args={"chat_name":chat_name,"question":question})
-    # 1. 创建ragflow客户端
-    # 2. 查询对应name的chat
+    session = None
+    use_chat = None
     try:
+        chat_name = chat_name.strip()
+        question = question.strip()
+        if not chat_name:
+            raise ValueError("chat_name 不能为空")
+        if not question:
+            raise ValueError("question 不能为空")
+
+        ragflow_client = _get_ragflow_client()
         chats = ragflow_client.list_chats(name=chat_name)
-        use_chat = chats[0] #选中我们要使用的助手
-        # 3. chat上创建一个会话
-        session = use_chat.create_session(name="temp_session_ask")
-        # 4. 使用会话进行提问
-        # 返回的提问结果是流式
-        response = session.ask(question = question,stream=True)
-        # 接收总结果
+        use_chat = next(
+            (chat for chat in chats if getattr(chat, "name", None) == chat_name),
+            None,
+        )
+        if use_chat is None:
+            raise LookupError(f"未找到名称为 {chat_name!r} 的 RAGFlow 助手")
+
+        session = use_chat.create_session(name=f"temp_session_ask_{uuid4().hex}")
+        response = session.ask(question=question, stream=True)
         result = ""
-        # 流的每一部分的对象 part
         for part in response:
-            # 数据存在对象中content上！！
-            # print(part.content)
-            result = part.content
-        # 5. 关闭提问的会话
-        # chat -> 关闭 -》  session
-        use_chat.delete_sessions(ids=[session.id])
-        # 6. 返回结果
+            content = str(getattr(part, "content", "") or "")
+            if content.startswith(result):
+                # RAGFlow 当前流式接口返回逐步累积的完整内容。
+                result = content
+            elif content and not result.endswith(content):
+                # 同时兼容未来可能返回增量片段的实现。
+                result += content
+
+        if not result.strip():
+            raise RuntimeError("RAGFlow 助手返回了空结果")
         return result
     except Exception as e:
-        return f"提问失败，错误原因：{str(e)}"
+        return tool_failure("create_ask_delete", e)
+    finally:
+        if use_chat is not None and session is not None:
+            try:
+                use_chat.delete_sessions(ids=[session.id])
+            except Exception as cleanup_error:
+                monitor.report_tool_error(
+                    "create_ask_delete.cleanup",
+                    str(cleanup_error),
+                    error_type=type(cleanup_error).__name__,
+                    retryable=True,
+                )
 
 # if __name__ == '__main__':
 #     # print(get_assistant_list())

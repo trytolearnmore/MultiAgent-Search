@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles as FastAPIStaticFiles
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import shutil
 
 # Add project root to sys.path
@@ -24,8 +24,8 @@ project_root = current_dir.parent
 sys.path.insert(0, str(project_root))
 
 # Import agent runner and monitor
-# 注意：agent.main_agent 导入时会初始化 main_agent，这可能需要几秒钟
-from agent.main_agent import run_deep_agent
+# 主智能体在 FastAPI 启动时异步初始化，并在服务关闭时释放资源
+from agent.main_agent import close_main_agent, initialize_main_agent, run_deep_agent
 from api.monitor import manager
 
 app = FastAPI(title="DeepAgents API")
@@ -65,7 +65,7 @@ app.add_middleware(
 )
 class TaskRequest(BaseModel):
     query: str
-    thread_id: str = None
+    thread_id: Optional[str] = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -75,7 +75,13 @@ async def startup_event():
     """
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
+    await initialize_main_agent()
     print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_main_agent()
 
 
 @app.post("/api/task")

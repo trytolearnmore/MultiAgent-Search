@@ -6,6 +6,7 @@ from langchain_core.tools import tool
 from api.monitor import monitor
 from api.context import get_session_context
 from utils.path_utils import resolve_path
+from utils.tool_result import tool_failure
 
 # 尝试导入可选依赖，实现按需加载
 try:
@@ -50,7 +51,11 @@ def read_file_content(
 
     # 检查文件是否存在（替代os.path.exists）
     if not file_path.exists():
-        return f"错误：文件 '{filename}' 不存在 (解析路径: {file_path})。"
+        return tool_failure(
+            "read_file_content",
+            f"文件 '{filename}' 不存在 (解析路径: {file_path})",
+            error_type="FileNotFoundError",
+        )
 
     # 获取后缀名（替代os.path.splitext，自动转小写）
     ext = file_path.suffix.lower()
@@ -62,26 +67,38 @@ def read_file_content(
 
         elif ext == '.docx':
             if docx is None:
-                return "错误：未安装 'python-docx' 库，无法读取 Word 文件。"
+                return tool_failure(
+                    "read_file_content",
+                    "未安装 'python-docx' 库，无法读取 Word 文件",
+                    error_type="MissingDependencyError",
+                )
             doc = docx.Document(str(file_path))  # 转字符串传给docx
             full_text = [para.text for para in doc.paragraphs]
             return '\n'.join(full_text)
 
         elif ext == '.pdf':
             if pypdf is None:
-                return "错误：未安装 'pypdf' 库，无法读取 PDF 文件。"
+                return tool_failure(
+                    "read_file_content",
+                    "未安装 'pypdf' 库，无法读取 PDF 文件",
+                    error_type="MissingDependencyError",
+                )
             reader = pypdf.PdfReader(str(file_path))  # 转字符串传给pypdf
             text = "\n".join([page.extract_text() or "" for page in reader.pages])
             return text
 
         elif ext in ['.xlsx', '.xls']:
             if pd is None:
-                return "错误：未安装 'pandas' 库，无法读取 Excel 文件。"
+                return tool_failure(
+                    "read_file_content",
+                    "未安装 'pandas' 库，无法读取 Excel 文件",
+                    error_type="MissingDependencyError",
+                )
 
             try:
                 df = pd.read_excel(str(file_path))  # 转字符串传给pandas
             except Exception as e:
-                return f"读取 Excel 失败: {str(e)}"
+                return tool_failure("read_file_content", e)
 
             result = [
                 f"文件: {filename}",
@@ -99,10 +116,14 @@ def read_file_content(
             try:
                 return file_path.read_text(encoding='utf-8')
             except UnicodeDecodeError:
-                return f"错误：不支持的文件格式 '{ext}'，且无法作为文本读取。"
+                return tool_failure(
+                    "read_file_content",
+                    f"不支持的文件格式 '{ext}'，且无法作为文本读取",
+                    error_type="UnsupportedFileTypeError",
+                )
 
     except Exception as e:
-        return f"读取文件出错: {str(e)}"
+        return tool_failure("read_file_content", e)
 
 # ====================== 测试入口（完全按你要求的格式） ======================
 if __name__ == '__main__':

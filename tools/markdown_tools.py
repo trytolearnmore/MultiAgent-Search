@@ -9,6 +9,7 @@ from langchain_core.tools import tool
 from api.monitor import monitor
 from api.context import get_session_context
 from utils.path_utils import resolve_path
+from utils.tool_result import tool_failure
 
 
 # Markdown生成工具
@@ -49,7 +50,7 @@ def generate_markdown(
         return f"Markdown文件 '{file_path}' 已成功生成并保存。"
     except Exception as e:
         logging.error(f"写入Markdown文件失败: {e}", exc_info=True)
-        return f"生成Markdown文件失败: {str(e)}"
+        return tool_failure("generate_markdown", e)
 
 
 # -------------------------- 测试代码（仅修改这里，给session_dir配置固定值） --------------------------

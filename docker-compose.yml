@@ -6,8 +6,6 @@
 # 查看日志: docker-compose logs -f app
 # ============================================
 
-version: "3.8"
-
 services:
   # ---------- MySQL 数据库 ----------
   mysql:

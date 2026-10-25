@@ -59,13 +59,13 @@ def convert_md_to_pdf_via_word(md_abs_path: Path, pdf_abs_path: Path) -> str:
         if pdf_abs_path.exists():
             return f"成功转换: {pdf_abs_path} (Word引擎)"
         else:
-            return f"转换完成但未生成文件: {pdf_abs_path}"
+            raise RuntimeError(f"转换完成但未生成文件: {pdf_abs_path}")
 
     except ImportError:
-        return "缺少依赖库，请安装: pip install pywin32 markdown"
+        raise RuntimeError("缺少依赖库，请安装: pip install pywin32 markdown")
     except Exception as e:
         logging.error(f"Word转换PDF失败: {e}", exc_info=True)
-        return f"转换失败: {str(e)}"
+        raise
 
     finally:
         # 3. 资源清理

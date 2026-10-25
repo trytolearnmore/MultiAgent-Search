@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Dict, Optional
 from fastapi import WebSocket
 from api.context import get_thread_context
+from api.task_logger import task_logger
 
 # 修复 Windows GBK 编码问题
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -46,6 +47,7 @@ class ToolMonitor:
 
     def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
         """内部发送方法"""
+        thread_id = get_thread_context()
         payload = {
             "type": "monitor_event",
             "event": event_type,
@@ -54,12 +56,22 @@ class ToolMonitor:
             "timestamp": datetime.datetime.now().isoformat()
         }
 
+        # 每个监控事件同时落一条轻量日志；logger 只保留白名单元数据。
+        try:
+            task_logger.write(
+                event_type,
+                message,
+                thread_id=thread_id,
+                data=data,
+            )
+        except Exception as e:
+            # 日志不可写不能反过来中断用户任务。
+            print(f"[Monitor] Task log write failed: {e}")
+
         # 1. 优先尝试通过 FastAPI WebSocket 发送 (定向推送)
         if self.websocket_manager:
             try:
                 # 获取当前线程 ID
-                thread_id = get_thread_context()
-
                 # 确保 loop 已加载 [fastapi的事件循环]
                 manager_loop = self.websocket_manager.loop
 
@@ -109,14 +121,68 @@ class ToolMonitor:
         """报告工具开始执行"""
         self._emit("tool_start", f"开始执行工具: {tool_name}", {"tool_name": tool_name, "args": args})
 
+    def report_tool_error(
+        self,
+        tool_name: str,
+        message: str,
+        *,
+        error_type: str,
+        retryable: bool,
+    ):
+        """报告工具失败，并向日志保留可检索的错误类别。"""
+        self._emit(
+            "tool_error",
+            f"工具执行失败: {tool_name} - {message}",
+            {
+                "tool_name": tool_name,
+                "error_type": error_type,
+                "retryable": retryable,
+            },
+        )
+
     def report_assistant(self, assistant_name: str, args: Dict[str, Any] = None):
         """报告正在调用的子智能体进度"""
         self._emit("assistant_call", f"正在调用助手: {assistant_name}",
                    {"assistant_name": assistant_name, "args": args})
 
-    def report_task_result(self, result: str):
+    def report_task_started(
+        self,
+        query_length: int,
+        reflection_enabled: bool,
+        max_network_searches: int | None = None,
+        max_database_queries: int | None = None,
+    ):
+        """报告任务开始，不记录用户问题正文。"""
+        self._emit(
+            "task_started",
+            f"任务开始执行（反思机制：{'开启' if reflection_enabled else '关闭'}）",
+            {
+                "query_length": query_length,
+                "reflection_enabled": reflection_enabled,
+                "max_network_searches": max_network_searches,
+                "max_database_queries": max_database_queries,
+            },
+        )
+
+    def report_artifact_retry(self, missing_extensions: set[str]):
+        """报告文件产物缺失后的自动纠正。"""
+        formats = "、".join(sorted(missing_extensions))
+        self._emit(
+            "artifact_retry",
+            f"未检测到要求的文件（{formats}），正在自动补充生成",
+        )
+
+    def report_task_result(self, result: str, duration_ms: int | None = None):
         """报告任务最终结果"""
-        self._emit("task_result", "任务执行完成", {"result": result})
+        self._emit(
+            "task_result",
+            "任务执行完成",
+            {"result": result, "duration_ms": duration_ms},
+        )
+
+    def report_error(self, message: str, duration_ms: int | None = None):
+        """报告任务级错误。"""
+        self._emit("error", message, {"duration_ms": duration_ms})
 
     def report_session_dir(self, path: str):
         """报告任务工作目录"""

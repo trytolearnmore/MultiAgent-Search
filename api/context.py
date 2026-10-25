@@ -1,4 +1,7 @@
+import os
+import threading
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Optional
 
 # =================================================================================================
@@ -37,6 +40,65 @@ _session_dir_ctx: ContextVar[Optional[str]] = ContextVar("session_dir", default=
 _thread_id_ctx: ContextVar[Optional[str]] = ContextVar("thread_id", default=None)
 
 
+@dataclass
+class TaskExecutionLimits:
+    """单个用户任务共享的硬限制，支持并行工具调用时的原子计数。"""
+
+    max_network_searches: int = 5
+    max_database_queries: int = 5
+    network_searches: int = 0
+    database_queries: int = 0
+    dispatched_subagents: set[str] = field(default_factory=set)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def try_consume_network_search(self) -> tuple[bool, int]:
+        """尝试占用一次网络搜索额度，返回是否成功及当前已用次数。"""
+        with self._lock:
+            if self.network_searches >= self.max_network_searches:
+                return False, self.network_searches
+            self.network_searches += 1
+            return True, self.network_searches
+
+    def try_consume_database_query(self) -> tuple[bool, int]:
+        """尝试占用一次自定义 SQL 查询额度。"""
+        with self._lock:
+            if self.database_queries >= self.max_database_queries:
+                return False, self.database_queries
+            self.database_queries += 1
+            return True, self.database_queries
+
+    def try_dispatch_subagent(self, subagent_type: str) -> bool:
+        """同一任务中，每种子智能体只允许实际执行一次。"""
+        with self._lock:
+            if subagent_type in self.dispatched_subagents:
+                return False
+            self.dispatched_subagents.add(subagent_type)
+            return True
+
+
+_task_limits_ctx: ContextVar[Optional[TaskExecutionLimits]] = ContextVar(
+    "task_execution_limits",
+    default=None,
+)
+
+
+def create_task_execution_limits() -> TaskExecutionLimits:
+    """根据环境变量创建本次任务的限制；非法值在启动任务时明确报错。"""
+    def read_positive_limit(name: str, default: str) -> int:
+        try:
+            value = int(os.getenv(name, default))
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是正整数") from exc
+        if value < 1:
+            raise ValueError(f"{name} 必须是正整数")
+        return value
+
+    return TaskExecutionLimits(
+        max_network_searches=read_positive_limit("MAX_NETWORK_SEARCHES", "5"),
+        max_database_queries=read_positive_limit("MAX_DATABASE_QUERIES", "5"),
+    )
+
+
 def set_session_context(path: str):
     """
     设置当前请求链路的会话目录。
@@ -70,7 +132,22 @@ def get_thread_context() -> Optional[str]:
     return _thread_id_ctx.get()
 
 
-def reset_session_context(session_token, thread_token=None):
+def set_task_execution_limits(limits: TaskExecutionLimits):
+    """绑定当前用户任务的执行限制。"""
+    return _task_limits_ctx.set(limits)
+
+
+def get_task_execution_limits() -> Optional[TaskExecutionLimits]:
+    """获取当前用户任务的执行限制；非任务脚本调用时可能为空。"""
+    return _task_limits_ctx.get()
+
+
+def reset_task_execution_limits(limits_token):
+    """仅重置任务限制上下文，供测试或独立调用使用。"""
+    _task_limits_ctx.reset(limits_token)
+
+
+def reset_session_context(session_token, thread_token=None, limits_token=None):
     """
     清理/重置上下文。
     通常在请求处理结束 (finally 块) 中调用，防止内存泄漏或污染后续请求。
@@ -78,3 +155,5 @@ def reset_session_context(session_token, thread_token=None):
     _session_dir_ctx.reset(session_token)
     if thread_token:
         _thread_id_ctx.reset(thread_token)
+    if limits_token:
+        _task_limits_ctx.reset(limits_token)

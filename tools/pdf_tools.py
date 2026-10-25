@@ -12,6 +12,7 @@ from api.monitor import monitor
 from api.context import get_session_context
 from utils.path_utils import resolve_path
 from utils.word_converter import convert_md_to_pdf_via_word
+from utils.tool_result import tool_failure
 
 
 @tool
@@ -33,7 +34,11 @@ def convert_md_to_pdf(
 
         # 2. 检查源文件
         if not md_abs_path.exists():
-            return f"错误：文件不存在 {md_abs_path}"
+            return tool_failure(
+                "convert_md_to_pdf",
+                f"文件不存在: {md_abs_path}",
+                error_type="FileNotFoundError",
+            )
 
         # 3. 确定输出路径
         if pdf_filename:
@@ -47,7 +52,7 @@ def convert_md_to_pdf(
 
     except Exception as e:
         logging.error(f"转换失败: {e}", exc_info=True)
-        return f"转换失败: {str(e)}"
+        return tool_failure("convert_md_to_pdf", e)
 
 
 if __name__ == '__main__':

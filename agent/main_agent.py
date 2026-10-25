@@ -1,8 +1,8 @@
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.network_search_agent import network_search_agent
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import aiosqlite
 
 # main_agent tool导入
 from tools.markdown_tools import generate_markdown
@@ -12,15 +12,29 @@ from tools.upload_file_read_tool import read_file_content
 from deepagents import create_deep_agent
 
 from agent.llm import model
-from agent.prompts import main_agent_content
+from agent.prompts import main_agent_content, reflection_enabled
+from agent.artifact_guard import (
+    build_artifact_recovery_prompt,
+    detect_requested_artifacts,
+    find_missing_artifacts,
+    snapshot_files,
+)
+from agent.execution_limits import SubagentDispatchLimitMiddleware
 
 from api.monitor import monitor
 import asyncio
 import uuid
 import shutil
+import time
 from pathlib import Path
 
-from api.context import set_session_context, reset_session_context, set_thread_context
+from api.context import (
+    create_task_execution_limits,
+    reset_session_context,
+    set_session_context,
+    set_task_execution_limits,
+    set_thread_context,
+)
 
 from langchain_core.messages import AIMessage
 
@@ -28,20 +42,49 @@ from langchain_core.messages import AIMessage
 # 服务重启后对话历史不丢失，支持多轮对话上下文
 checkpoint_db_path = Path(__file__).parents[1] / "data" / "checkpoints.db"
 checkpoint_db_path.parent.mkdir(parents=True, exist_ok=True)
-_conn = sqlite3.connect(str(checkpoint_db_path), check_same_thread=False)
-checkpointer = SqliteSaver(_conn)
+_conn = None
+checkpointer = None
+main_agent = None
+_agent_init_lock = asyncio.Lock()
 
-main_agent = create_deep_agent(
-   model = model,
-   system_prompt=main_agent_content['system_prompt'],
-   tools= [generate_markdown,convert_md_to_pdf,read_file_content],
-   checkpointer=checkpointer,
-   subagents=[
-       database_query_agent,
-       network_search_agent,
-       knowledge_base_agent
-   ]
-)
+
+async def initialize_main_agent():
+    """在当前事件循环中初始化异步 checkpoint 和主智能体。"""
+    global _conn, checkpointer, main_agent
+
+    if main_agent is not None:
+        return main_agent
+
+    async with _agent_init_lock:
+        if main_agent is None:
+            _conn = await aiosqlite.connect(str(checkpoint_db_path))
+            checkpointer = AsyncSqliteSaver(_conn)
+            await checkpointer.setup()
+            main_agent = create_deep_agent(
+                model=model,
+                system_prompt=main_agent_content["system_prompt"],
+                tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+                checkpointer=checkpointer,
+                subagents=[
+                    database_query_agent,
+                    network_search_agent,
+                    knowledge_base_agent,
+                ],
+                middleware=[SubagentDispatchLimitMiddleware()],
+            )
+
+    return main_agent
+
+
+async def close_main_agent():
+    """服务关闭时释放 SQLite 连接。"""
+    global _conn, checkpointer, main_agent
+
+    if _conn is not None:
+        await _conn.close()
+    _conn = None
+    checkpointer = None
+    main_agent = None
 
 # 执行
 """
@@ -68,6 +111,7 @@ async def run_deep_agent(task_query,session_id):
     task_query: 前端提问的问题
     session_id: 每个前端会话对应的标识 （1.存储session_id ContextVars 2.session_id 给他创建对应的output输出地址）
     """
+    started_at = time.perf_counter()
     print(f"当前会话的main_agent开始执行了！ 会话id:{session_id}")
     # 准备工作 【1. session_dir（前端） 2. relative_session_dir (大模型) 3. 上传的文件拼接上传文件专属提示词】
     # project_root_path / output / session_session_id(uuid)
@@ -100,10 +144,20 @@ async def run_deep_agent(task_query,session_id):
                              "\n    请优先使用工具（read_file_content）读取并参考这些文件。")
 
     # 继续准备 1. 当前会话的对应的session_id session_dir 存储到contextVars [后续工具获取，socket -> 推送消息] 2.调用monitor给前端推送session_dir信息
+    task_limits = create_task_execution_limits()
     session_dir_token = set_session_context(session_dir_str)  # 存储的当前会话对应的文件夹地址
     session_id_token = set_thread_context(session_id)  #获取当前会话的session_id对应socket
+    limits_token = set_task_execution_limits(task_limits)
 
     monitor.report_session_dir(session_dir_str)  # 当前会话对应的文件夹地址推送给起前端！
+    monitor.report_task_started(
+        len(task_query),
+        reflection_enabled,
+        task_limits.max_network_searches,
+        task_limits.max_database_queries,
+    )
+    requested_artifacts = detect_requested_artifacts(task_query)
+    baseline_files = snapshot_files(session_dir)
 
     # 执行main_agent
     config = {
@@ -126,45 +180,65 @@ async def run_deep_agent(task_query,session_id):
     """
     # 反馈结果
     try:
-        # 执行
-        async for chunk in main_agent.astream({
-            "messages":[
-                {
-                    "role":"user","content":task_query+path_instruction
-                }
-            ]
-        },config=config):
-            # {"model [大模型决定调用工具 子智能体  最终结果] / tools" : {messages:[xxx...]}}
-            for node_name,state in chunk.items():
-                if not state or "messages" not in state: continue
-                messages = state["messages"]
-                if messages and isinstance(messages,list):
+        agent = await initialize_main_agent()
+
+        async def stream_agent(user_content: str):
+            """执行一轮 Agent，并延迟上报最终结果以便先验证文件产物。"""
+            final_content = None
+            async for chunk in agent.astream(
+                {"messages": [{"role": "user", "content": user_content}]},
+                config=config,
+            ):
+                # {"model [大模型决定调用工具 子智能体 最终结果] / tools": {messages:[...]}}
+                for node_name, state in chunk.items():
+                    if not state or "messages" not in state:
+                        continue
+                    messages = state["messages"]
+                    if not messages or not isinstance(messages, list):
+                        continue
                     last_msg = messages[-1]
-                    if node_name == 'model':
-                        if last_msg.tool_calls:
-                            # 工具和子智能体
-                            for tool_call in last_msg.tool_calls:
-                                """
-                                  tool_call = {
-                                      name: task
-                                      args:{
-                                          subagent_type:子智能体的名字
-                                          description:子智能体的描述
-                                      }
-                                  }                                
-                                """
-                                if tool_call['name'] == 'task':
-                                    # 调用某个子智能体
-                                    monitor.report_assistant(tool_call['args']['subagent_type'],{'description':tool_call['args']['description']})
-                        elif last_msg.content:
-                            # 最终结果
-                            print(f"主智能体执行结果，最终结果：{last_msg.content[:100]}")
-                            monitor.report_task_result(last_msg.content)
+                    if node_name != "model":
+                        continue
+                    if not last_msg.tool_calls and last_msg.content:
+                        final_content = last_msg.content
+            return final_content
+
+        final_content = await stream_agent(task_query + path_instruction)
+
+        missing_artifacts = find_missing_artifacts(
+            session_dir,
+            baseline_files,
+            requested_artifacts,
+        )
+        if missing_artifacts:
+            monitor.report_artifact_retry(missing_artifacts)
+            recovery_content = build_artifact_recovery_prompt(missing_artifacts)
+            recovered_content = await stream_agent(recovery_content + path_instruction)
+            final_content = recovered_content or final_content
+            missing_artifacts = find_missing_artifacts(
+                session_dir,
+                baseline_files,
+                requested_artifacts,
+            )
+
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        if missing_artifacts:
+            missing_formats = "、".join(sorted(missing_artifacts))
+            monitor.report_error(
+                f"任务未完成：未能生成要求的文件（{missing_formats}）",
+                duration_ms,
+            )
+        elif final_content:
+            print(f"主智能体执行结果，最终结果：{final_content[:100]}")
+            monitor.report_task_result(final_content, duration_ms)
+        else:
+            monitor.report_error("任务未完成：主智能体没有返回最终结果", duration_ms)
 
     except Exception as e :
         # 报错推送错误信息给前端
-        monitor._emit("error",f"执行主智能发生异常信息：{str(e)}")
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        monitor.report_error(f"执行主智能体发生异常：{str(e)}", duration_ms)
     finally:
         # 释放存储的地址和session_id
-        reset_session_context(session_dir_token, session_id_token)
+        reset_session_context(session_dir_token, session_id_token, limits_token)
 
